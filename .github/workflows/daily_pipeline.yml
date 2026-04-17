@@ -33,7 +33,7 @@ jobs:
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
-        run: python "Orchestration Layer/Orchestration.py"
+        run: python "Orchestration Layer/main.py"
 
       - name: Commit memory files
         run: |
