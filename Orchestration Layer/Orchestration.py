@@ -1,137 +1,122 @@
 """
-Orchestration Layer — routes tasks to pre-created Managed Agents via the Claude API.
+Morning Briefing Pipeline
+--------------------------
+Runs daily via GitHub Actions at 8am SGT (00:00 UTC).
+
+Flow (each layer runs in parallel, feeds into the next):
+  Layer 1 -- Data Fetchers     : market prices, news, macro data, etc.
+  Layer 2 -- Sector Specialists: insurance, energy, tech, etc.
+  Layer 3 -- Synthesis         : macro agent, value investing agent, etc.
+  Final   -- Claude API        : composes formatted email
+             Gmail SMTP        : sends to recipient
+
+To add an agent to the pipeline:
+  1. Create the agent in the Anthropic console (with its own system prompt / .md files)
+  2. Add AGENT_ID_<NAME> to .env and GitHub Secrets
+     Optionally: AGENT_VER_<NAME>, AGENT_VAULT_<NAME>
+  3. Add the agent name to the correct layer in PIPELINE below
+     Layer 1 agents: provide a prompt string (they fetch data from scratch)
+     Layer 2+ agents: use None  (they receive previous layer outputs; their
+                                 system prompts define what to do with the data)
 
 SETUP:
-  pip install anthropic
+  pip install -r requirements.txt
 
-REQUIRED ENV VARS:
-  ANTHROPIC_API_KEY   — your Anthropic API key
-  ENVIRONMENT_ID      — the managed-agents environment ID (env_...)
+LOCAL ENV VARS (.env):
+  ANTHROPIC_API_KEY, ENVIRONMENT_ID,
+  AGENT_ID_<NAME>, AGENT_VER_<NAME> (optional), AGENT_VAULT_<NAME> (optional),
+  EMAIL_ADDRESS, EMAIL_APP_PASSWORD, EMAIL_RECIPIENT
 
-AGENT ENV VARS (add one per agent you created):
-  AGENT_ID_<NAME>     — e.g. AGENT_ID_RESEARCHER, AGENT_ID_CODER, AGENT_ID_ANALYST
-  AGENT_VER_<NAME>    — optional pinned version; omit to use latest
-
-USAGE:
-  orchestrator = Orchestrator()
-  response = orchestrator.run("researcher", "Summarize the latest AI papers.")
-  print(response)
+GITHUB SECRETS (mirrors .env):
+  Same keys as above, set in repo Settings > Secrets > Actions
 """
 
 import os
-import json
+import sys
+import smtplib
 import anthropic
+from pathlib import Path
+
+# Ensure the Orchestration Layer directory is on the path so prompts/ is importable
+sys.path.insert(0, str(Path(__file__).parent))
+from datetime import datetime, timezone, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dotenv import load_dotenv
+from prompts.market_data_retrieval import PROMPT as MARKET_PROMPT
+from prompts.passthrough import PROMPT as PASSTHROUGH_PROMPT
+from prompts.email_composer import PROMPT as EMAIL_COMPOSE_PROMPT
+
+# Load .env for local runs (GitHub Actions uses repo secrets directly)
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 
-# ---------------------------------------------------------------------------
-# Config — agent registry built from environment variables
-# ---------------------------------------------------------------------------
+# --------------------------------------------
+# Pipeline configuration
+# Edit this block to add/remove agents and layers.
+# --------------------------------------------
 
-def _load_agent_registry() -> dict[str, dict]:
-    """
-    Scans env vars for AGENT_ID_<NAME> entries and builds a registry like:
-      { "researcher": {"id": "agent_abc123", "version": "..."}, ... }
-    """
-    registry: dict[str, dict] = {}
-    for key, value in os.environ.items():
-        if key.startswith("AGENT_ID_"):
-            name = key[len("AGENT_ID_"):].lower()
-            entry: dict = {"id": value}
-            version = os.environ.get(f"AGENT_VER_{name.upper()}")
-            if version:
-                entry["version"] = version
-            registry[name] = entry
-    return registry
+PIPELINE = [
+    {
+        "name": "Data Fetchers",
+        "agents": {
+            "market_data_retrieval": MARKET_PROMPT,
+            # "news": NEWS_PROMPT,
+            # "macro_data": MACRO_DATA_PROMPT,
+        },
+    },
+    {
+        "name": "Sector Specialists",
+        "agents": {
+            "insurance_specialist": None,
+            # "energy_specialist": None,
+            # "tech_specialist": None,
+        },
+    },
+    # {
+    #     "name": "Synthesis",
+    #     "agents": {
+    #         "macro_agent": None,
+    #         "value_investing_agent": None,
+    #         "portfolio_agent": None,
+    #     },
+    # },
+]
 
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------
 # Orchestrator
-# ---------------------------------------------------------------------------
+# --------------------------------------------
 
 class Orchestrator:
-    """
-    Routes tasks to pre-created Managed Agents and streams their responses.
-
-    Each call to `run()` creates a fresh session, sends one user message,
-    streams all events until the agent goes idle, handles any custom tool
-    calls your application owns, then cleans up the session.
-    """
-
     def __init__(self):
-        self.client = anthropic.Anthropic(
-            api_key=os.environ["ANTHROPIC_API_KEY"]
-        )
-        self.environment_id: str = os.environ["ENVIRONMENT_ID"]
-        self.agents: dict[str, dict] = _load_agent_registry()
+        self.client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        self.environment_id = os.environ["ENVIRONMENT_ID"]
+        self.agents = self._load_agents()
 
-        if not self.agents:
-            raise RuntimeError(
-                "No agents found. Set AGENT_ID_<NAME> environment variables "
-                "for each agent you created in the Managed Agents interface."
-            )
+    def _load_agents(self) -> dict:
+        registry = {}
+        for key, value in os.environ.items():
+            if key.startswith("AGENT_ID_"):
+                name = key[len("AGENT_ID_"):].lower()
+                entry = {"id": value}
+                version = os.environ.get(f"AGENT_VER_{name.upper()}")
+                if version:
+                    entry["version"] = version
+                vault = os.environ.get(f"AGENT_VAULT_{name.upper()}")
+                if vault:
+                    entry["vault_id"] = vault
+                registry[name] = entry
+        return registry
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def list_agents(self) -> list[str]:
-        """Return the names of all registered agents."""
-        return list(self.agents.keys())
-
-    def run(
-        self,
-        agent_name: str,
-        user_message: str,
-        custom_tool_handler: "dict[str, callable] | None" = None,
-        resources: "list[dict] | None" = None,
-        vault_ids: "list[str] | None" = None,
-        verbose: bool = True,
-    ) -> str:
-        """
-        Send `user_message` to the named agent and return the full text response.
-
-        Args:
-            agent_name:          Key matching an AGENT_ID_<NAME> env var (case-insensitive).
-            user_message:        The message to send.
-            custom_tool_handler: Optional dict mapping tool name → callable(input) → str.
-                                 Called when the agent invokes a custom tool you defined.
-            resources:           Optional list of session resources (files, GitHub repos).
-            vault_ids:           Optional list of vault IDs for MCP credentials.
-            verbose:             Print streaming events to stdout while running.
-
-        Returns:
-            Concatenated text from all agent.message events.
-        """
+    def run(self, agent_name: str, prompt: str, verbose: bool = True) -> str:
         agent_name = agent_name.lower()
         if agent_name not in self.agents:
-            available = ", ".join(self.agents)
             raise ValueError(
-                f"Unknown agent '{agent_name}'. Available agents: {available}"
+                f"Unknown agent '{agent_name}'. Available: {list(self.agents.keys())}"
             )
 
-        session = self._create_session(agent_name, resources, vault_ids)
-        session_id = session.id
-
-        try:
-            return self._run_session(
-                session_id=session_id,
-                user_message=user_message,
-                custom_tool_handler=custom_tool_handler or {},
-                verbose=verbose,
-            )
-        finally:
-            self._cleanup_session(session_id)
-
-    # ------------------------------------------------------------------
-    # Session lifecycle
-    # ------------------------------------------------------------------
-
-    def _create_session(
-        self,
-        agent_name: str,
-        resources: "list[dict] | None",
-        vault_ids: "list[str] | None",
-    ):
         agent_cfg = self.agents[agent_name]
         agent_ref = {"type": "agent", "id": agent_cfg["id"]}
         if "version" in agent_cfg:
@@ -140,196 +125,193 @@ class Orchestrator:
         kwargs: dict = {
             "agent": agent_ref,
             "environment_id": self.environment_id,
-            "title": f"Orchestration — {agent_name}",
+            "title": f"Pipeline -- {agent_name}",
         }
-        if resources:
-            kwargs["resources"] = resources
-        if vault_ids:
-            kwargs["vault_ids"] = vault_ids
+        if "vault_id" in agent_cfg:
+            kwargs["vault_ids"] = [agent_cfg["vault_id"]]
 
-        return self.client.beta.sessions.create(**kwargs)
+        session = self.client.beta.sessions.create(**kwargs)
 
-    def _cleanup_session(self, session_id: str) -> None:
         try:
-            self.client.beta.sessions.delete(session_id=session_id)
-        except Exception:
-            pass  # best-effort cleanup
+            return self._stream_session(session.id, prompt, verbose)
+        finally:
+            try:
+                self.client.beta.sessions.delete(session_id=session.id)
+            except Exception:
+                pass
 
-    # ------------------------------------------------------------------
-    # Event streaming loop
-    # ------------------------------------------------------------------
+    def _stream_session(self, session_id: str, prompt: str, verbose: bool) -> str:
+        collected: list[str] = []
 
-    def _run_session(
-        self,
-        session_id: str,
-        user_message: str,
-        custom_tool_handler: "dict[str, callable]",
-        verbose: bool,
-    ) -> str:
-        """
-        Opens the SSE stream before sending the message (stream-first pattern),
-        collects all agent output, and handles custom tool calls in a loop
-        until the session reaches a terminal idle state.
-        """
-        collected_text: list[str] = []
-
-        # Send the initial user message
         self.client.beta.sessions.events.send(
             session_id=session_id,
-            events=[
-                {
-                    "type": "user.message",
-                    "content": [{"type": "text", "text": user_message}],
-                }
-            ],
+            events=[{"type": "user.message", "content": [{"type": "text", "text": prompt}]}],
         )
 
-        # Stream until the agent is done or the session terminates
         while True:
-            pending_tool_calls: list[dict] = []
+            pending_tools: list[dict] = []
 
-            with self.client.beta.sessions.stream(session_id=session_id) as stream:
+            with self.client.beta.sessions.events.stream(session_id=session_id) as stream:
                 for event in stream:
-                    self._handle_event(
-                        event=event,
-                        collected_text=collected_text,
-                        pending_tool_calls=pending_tool_calls,
-                        verbose=verbose,
-                    )
+                    if event.type == "agent.message":
+                        for block in getattr(event, "content", []):
+                            if getattr(block, "type", None) == "text":
+                                collected.append(block.text)
+                                if verbose:
+                                    print(block.text, end="", flush=True)
 
-                    # Terminal states — stop streaming
-                    if event.type == "session.status_terminated":
-                        return "".join(collected_text)
+                    elif event.type == "agent.custom_tool_use":
+                        pending_tools.append({
+                            "id": event.id,
+                            "name": getattr(event, "tool_name", ""),
+                            "input": getattr(event, "input", {}),
+                        })
 
-                    if event.type == "session.status_idle":
-                        stop_reason = getattr(event, "stop_reason", None)
+                    elif event.type == "session.status_terminated":
+                        return "".join(collected)
+
+                    elif event.type == "session.status_idle":
+                        stop = getattr(event, "stop_reason", None)
                         stop_type = (
-                            stop_reason.get("type")
-                            if isinstance(stop_reason, dict)
-                            else getattr(stop_reason, "type", None)
+                            stop.get("type") if isinstance(stop, dict)
+                            else getattr(stop, "type", None)
                         )
                         if stop_type != "requires_action":
-                            # Normal completion or retries exhausted — done
-                            return "".join(collected_text)
-                        # requires_action means we owe tool results — fall through
+                            return "".join(collected)
                         break
 
-            # Resolve pending custom tool calls and send results back
-            if pending_tool_calls:
-                results = self._resolve_tool_calls(pending_tool_calls, custom_tool_handler)
-                self.client.beta.sessions.events.send(
-                    session_id=session_id,
-                    events=results,
-                )
+            if pending_tools:
+                results = [
+                    {
+                        "type": "user.custom_tool_result",
+                        "custom_tool_use_id": t["id"],
+                        "content": [{"type": "text", "text": f"No handler for '{t['name']}'"}],
+                        "is_error": True,
+                    }
+                    for t in pending_tools
+                ]
+                self.client.beta.sessions.events.send(session_id=session_id, events=results)
             else:
-                # requires_action but no tool calls — safety exit
                 break
 
-        return "".join(collected_text)
+        return "".join(collected)
 
-    # ------------------------------------------------------------------
-    # Event handler
-    # ------------------------------------------------------------------
-
-    def _handle_event(
-        self,
-        event,
-        collected_text: list[str],
-        pending_tool_calls: list[dict],
-        verbose: bool,
-    ) -> None:
-        etype = event.type
-
-        if etype == "agent.message":
-            for block in getattr(event, "content", []):
-                btype = getattr(block, "type", None)
-                if btype == "text":
-                    text = block.text
-                    collected_text.append(text)
-                    if verbose:
-                        print(text, end="", flush=True)
-
-        elif etype == "agent.thinking":
-            if verbose:
-                for block in getattr(event, "content", []):
-                    if getattr(block, "type", None) == "thinking":
-                        print(f"\n[thinking] {block.thinking[:120]}…", flush=True)
-
-        elif etype == "agent.custom_tool_use":
-            tool_name = getattr(event, "tool_name", "") or getattr(event, "name", "")
-            tool_input = getattr(event, "input", {})
-            event_id = event.id
-            if verbose:
-                print(f"\n[custom tool] {tool_name}({json.dumps(tool_input)[:80]})", flush=True)
-            pending_tool_calls.append({
-                "id": event_id,
-                "name": tool_name,
-                "input": tool_input,
-            })
-
-        elif etype == "session.error":
-            error = getattr(event, "error", event)
-            if verbose:
-                print(f"\n[session error] {error}", flush=True)
-
-        elif etype in ("session.status_idle", "session.status_running",
-                       "session.status_terminated"):
-            if verbose:
-                print(f"\n[{etype}]", flush=True)
-
-    # ------------------------------------------------------------------
-    # Custom tool resolution
-    # ------------------------------------------------------------------
-
-    def _resolve_tool_calls(
-        self,
-        pending: list[dict],
-        handler: "dict[str, callable]",
-    ) -> list[dict]:
-        results = []
-        for call in pending:
-            tool_name: str = call["name"]
-            tool_input: dict = call["input"]
-
-            fn = handler.get(tool_name)
-            if fn:
-                try:
-                    result_text = fn(tool_input)
-                    is_error = False
-                except Exception as exc:
-                    result_text = f"Error running {tool_name}: {exc}"
-                    is_error = True
+    def run_layer(self, layer: dict, previous_context: str = "") -> dict[str, str]:
+        """Run all agents in a layer in parallel. Returns {agent_name: output}."""
+        agents_prompts: dict[str, str] = {}
+        for agent_name, prompt in layer["agents"].items():
+            if prompt is not None:
+                agents_prompts[agent_name] = prompt
             else:
-                result_text = f"No handler registered for tool '{tool_name}'."
-                is_error = True
+                agents_prompts[agent_name] = PASSTHROUGH_PROMPT.format(
+                    previous_outputs=previous_context
+                )
 
-            results.append({
-                "type": "user.custom_tool_result",
-                "custom_tool_use_id": call["id"],
-                "content": [{"type": "text", "text": result_text}],
-                "is_error": is_error,
-            })
+        results: dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=len(agents_prompts)) as executor:
+            futures = {
+                executor.submit(self.run, name, p): name
+                for name, p in agents_prompts.items()
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    results[name] = future.result()
+                except Exception as e:
+                    print(f"\n[ERROR] {name} failed: {e}")
+                    results[name] = f"[Agent failed: {e}]"
+
         return results
 
 
-# ---------------------------------------------------------------------------
-# CLI entry point — quick test
-# ---------------------------------------------------------------------------
+# --------------------------------------------
+# Format layer outputs into a single context block
+# --------------------------------------------
 
-if __name__ == "__main__":
-    import sys
+def format_outputs(outputs: dict[str, str]) -> str:
+    sections = []
+    for agent_name, output in outputs.items():
+        label = agent_name.upper().replace("_", " ")
+        sections.append(f"=== {label} ===\n{output}\n=== END {label} ===")
+    return "\n\n".join(sections)
+
+
+# --------------------------------------------
+# Email composer -- direct Claude API call
+# --------------------------------------------
+
+def compose_email(client: anthropic.Anthropic, final_output: str) -> tuple[str, str]:
+    """Returns (subject, html_body)."""
+    prompt = EMAIL_COMPOSE_PROMPT.format(final_output=final_output)
+    response = client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    full_text = next(b.text for b in response.content if b.type == "text")
+
+    lines = full_text.strip().split("\n")
+    subject = "Morning Briefing"
+    body_start = 0
+    if lines[0].startswith("SUBJECT:"):
+        subject = lines[0].replace("SUBJECT:", "").strip()
+        body_start = 1
+
+    html_body = "\n".join(lines[body_start:]).strip()
+    return subject, html_body
+
+
+# --------------------------------------------
+# Email sender -- Gmail SMTP
+# --------------------------------------------
+
+def send_email(subject: str, html_body: str) -> None:
+    sender = os.environ["EMAIL_ADDRESS"]
+    password = os.environ["EMAIL_APP_PASSWORD"]
+    recipient = os.environ["EMAIL_RECIPIENT"]
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg.attach(MIMEText(html_body, "html"))
+
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server.starttls()
+        server.login(sender, password)
+        server.sendmail(sender, recipient, msg.as_string())
+
+    print(f"\n[OK] Email sent to {recipient}")
+
+
+# --------------------------------------------
+# Daily pipeline
+# --------------------------------------------
+
+def run_pipeline():
+    sgt = timezone(timedelta(hours=8))
+    today = datetime.now(sgt).strftime("%A, %d %B %Y")
+    print(f"=== Morning Briefing Pipeline -- {today} ===\n")
 
     orchestrator = Orchestrator()
-    print("Registered agents:", orchestrator.list_agents())
+    previous_context = ""
 
-    if len(sys.argv) < 3:
-        print("\nUsage: python Orchestration.py <agent_name> <message>")
-        print('Example: python Orchestration.py researcher "Summarize AI news."')
-        sys.exit(0)
+    for i, layer in enumerate(PIPELINE, 1):
+        print(f"-- Layer {i}: {layer['name']} --")
+        outputs = orchestrator.run_layer(layer, previous_context)
+        previous_context = format_outputs(outputs)
+        print(f"\n[Layer {i} complete]\n")
 
-    agent = sys.argv[1]
-    message = " ".join(sys.argv[2:])
+    print("-- Composing email --")
+    # Compose and send email from the final layer's combined output
+    subject, html_body = compose_email(orchestrator.client, previous_context)
+    print(f"Subject: {subject}")
 
-    print(f"\n--- Sending to agent '{agent}' ---\n")
-    response = orchestrator.run(agent, message)
-    print(f"\n\n--- Final response ---\n{response}")
+    print("-- Sending email --")
+    send_email(subject, html_body)
+
+    print("\n=== Pipeline complete ===")
+
+
+if __name__ == "__main__":
+    run_pipeline()

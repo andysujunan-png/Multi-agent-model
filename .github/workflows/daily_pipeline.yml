@@ -1,0 +1,34 @@
+name: Daily Morning Briefing
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 8am SGT (UTC+8) = 00:00 UTC
+  workflow_dispatch:       # allows manual trigger from GitHub UI
+
+jobs:
+  send-briefing:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ENVIRONMENT_ID: ${{ secrets.ENVIRONMENT_ID }}
+          AGENT_ID_INSURANCE_SPECIALIST: ${{ secrets.AGENT_ID_INSURANCE_SPECIALIST }}
+          AGENT_ID_MARKET_DATA_RETRIEVAL: ${{ secrets.AGENT_ID_MARKET_DATA_RETRIEVAL }}
+          AGENT_VAULT_MARKET_DATA_RETRIEVAL: ${{ secrets.AGENT_VAULT_MARKET_DATA_RETRIEVAL }}
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+        run: python "Orchestration Layer/Orchestration.py"
