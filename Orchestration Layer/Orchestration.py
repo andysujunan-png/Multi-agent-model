@@ -356,11 +356,6 @@ def run_pipeline():
 
         print(f"\n-- Compressing Layer {i} output --")
         previous_context = compress_layer_output(orchestrator.client, outputs)
-        print(f"\n{'='*60}")
-        print(f"COMPRESSED OUTPUT PASSED TO LAYER {i+1}:")
-        print(f"{'='*60}")
-        print(previous_context)
-        print(f"{'='*60}\n")
         print(f"[Layer {i} complete]\n")
 
     print("-- Composing email --")
