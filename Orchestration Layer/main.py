@@ -43,7 +43,7 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 from orchestrator import Orchestrator, compress
-from email import compose_email, send_email
+from mailer import compose_email, send_email
 from memory import load_memory, save_daily_memory, compress_monthly_memory
 from publisher import publish
 from prompts.market_data_retrieval import PROMPT as MARKET_PROMPT

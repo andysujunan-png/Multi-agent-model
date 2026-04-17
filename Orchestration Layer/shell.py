@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from orchestrator import Orchestrator, compress
-from email import compose_email, send_email
+from mailer import compose_email, send_email
 from memory import load_memory, save_daily_memory
 from main import run_pipeline, PIPELINE
 
