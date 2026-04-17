@@ -82,10 +82,10 @@ MODEL_MEMORY_MONTHLY  = "claude-haiku-4-5-20251001"  # compress monthly memory s
 MODEL_EMAIL           = "claude-opus-4-6"            # email composition (quality matters)
 
 # Max tokens per direct API call
-MAX_TOKENS_COMPRESS       = 4096
+MAX_TOKENS_COMPRESS       = 6144
 MAX_TOKENS_MEMORY_DAILY   = 400   # tight — daily entries must stay concise
 MAX_TOKENS_MEMORY_MONTHLY = 600   # monthly summaries slightly longer
-MAX_TOKENS_EMAIL          = 2048
+MAX_TOKENS_EMAIL          = 4096
 
 # Memory configuration
 MEMORY_DAILY_LOOKBACK   = 7   # days of daily files to inject per run
