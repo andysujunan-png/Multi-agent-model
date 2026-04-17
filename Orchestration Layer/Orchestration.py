@@ -4,11 +4,14 @@ Morning Briefing Pipeline
 Runs daily via GitHub Actions at 8am SGT (00:00 UTC).
 
 Flow (each layer runs in parallel, feeds into the next):
-  Layer 1 -- Data Fetchers     : market prices, news, macro data, etc.
-  Layer 2 -- Sector Specialists: insurance, energy, tech, etc.
-  Layer 3 -- Synthesis         : macro agent, value investing agent, etc.
+  Layer 1 -- Data Fetchers     : universal market data (macro, rates, FX, indices, commodities)
+  Layer 2 -- Sector Specialists: insurance, banks, energy, etc. (each also fetches own niche data)
+  Layer 3 -- Synthesis         : macro agent, value investing agent, portfolio agent, etc.
   Final   -- Claude API        : composes formatted email
              Gmail SMTP        : sends to recipient
+
+Between each layer, a compression step (Haiku) summarises outputs before passing to the next
+layer, keeping token usage minimal.
 
 To add an agent to the pipeline:
   1. Create the agent in the Anthropic console (with its own system prompt / .md files)
@@ -16,8 +19,8 @@ To add an agent to the pipeline:
      Optionally: AGENT_VER_<NAME>, AGENT_VAULT_<NAME>
   3. Add the agent name to the correct layer in PIPELINE below
      Layer 1 agents: provide a prompt string (they fetch data from scratch)
-     Layer 2+ agents: use None  (they receive previous layer outputs; their
-                                 system prompts define what to do with the data)
+     Layer 2+ agents: use None  (they receive compressed previous layer output;
+                                 their system prompts define what to do with the data)
 
 SETUP:
   pip install -r requirements.txt
@@ -39,6 +42,11 @@ from pathlib import Path
 
 # Ensure the Orchestration Layer directory is on the path so prompts/ is importable
 sys.path.insert(0, str(Path(__file__).parent))
+
+# Force UTF-8 output so special characters don't crash on Windows terminals
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -52,10 +60,29 @@ from prompts.email_composer import PROMPT as EMAIL_COMPOSE_PROMPT
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 
-# --------------------------------------------
+# ============================================================
+# MODEL DEFINITIONS
+# Edit here to change models for any function. One place only.
+# ============================================================
+
+# Managed agents (set in each agent's YAML on Anthropic console, listed here for reference)
+# market_data_retrieval : claude-sonnet-4-6
+# sector specialists    : claude-sonnet-4-6
+# synthesis agents      : claude-sonnet-4-6
+
+# Direct Claude API calls made by this orchestrator:
+MODEL_COMPRESS   = "claude-haiku-4-5-20251001"   # layer-boundary compression (cheap, fast)
+MODEL_EMAIL      = "claude-opus-4-6"              # email composition (quality matters)
+
+# Max tokens per direct API call
+MAX_TOKENS_COMPRESS = 4096
+MAX_TOKENS_EMAIL    = 2048
+
+
+# ============================================================
 # Pipeline configuration
 # Edit this block to add/remove agents and layers.
-# --------------------------------------------
+# ============================================================
 
 PIPELINE = [
     {
@@ -63,15 +90,14 @@ PIPELINE = [
         "agents": {
             "market_data_retrieval": MARKET_PROMPT,
             # "news": NEWS_PROMPT,
-            # "macro_data": MACRO_DATA_PROMPT,
         },
     },
     {
         "name": "Sector Specialists",
         "agents": {
             "insurance_specialist": None,
+            # "banks_specialist": None,
             # "energy_specialist": None,
-            # "tech_specialist": None,
         },
     },
     # {
@@ -85,9 +111,9 @@ PIPELINE = [
 ]
 
 
-# --------------------------------------------
+# ============================================================
 # Orchestrator
-# --------------------------------------------
+# ============================================================
 
 class Orchestrator:
     def __init__(self):
@@ -224,28 +250,56 @@ class Orchestrator:
         return results
 
 
-# --------------------------------------------
-# Format layer outputs into a single context block
-# --------------------------------------------
+# ============================================================
+# Layer boundary compression  (MODEL_COMPRESS)
+# Summarises all agent outputs from a layer into a compact
+# context block before passing to the next layer.
+# ============================================================
 
-def format_outputs(outputs: dict[str, str]) -> str:
+def compress_layer_output(client: anthropic.Anthropic, outputs: dict[str, str]) -> str:
+    """
+    Compresses all agent outputs from a layer into a concise structured summary.
+    Uses MODEL_COMPRESS (Haiku) — cheap and fast.
+    Preserves all key numbers, tickers, and data points.
+    """
     sections = []
     for agent_name, output in outputs.items():
         label = agent_name.upper().replace("_", " ")
         sections.append(f"=== {label} ===\n{output}\n=== END {label} ===")
-    return "\n\n".join(sections)
+    combined = "\n\n".join(sections)
+
+    response = client.messages.create(
+        model=MODEL_COMPRESS,
+        max_tokens=MAX_TOKENS_COMPRESS,
+        messages=[{
+            "role": "user",
+            "content": (
+                "Compress the following agent outputs by removing redundancy, filler text, "
+                "and repetition only. Preserve every data point, number, ticker, percentage "
+                "move, yield, price level, and piece of analysis in full — do not summarise "
+                "or drop any factual content. Use bullet points. Label each agent's section "
+                "clearly.\n\n"
+                + combined
+            ),
+        }],
+    )
+    return response.content[0].text
 
 
-# --------------------------------------------
-# Email composer -- direct Claude API call
-# --------------------------------------------
+# ============================================================
+# Email composer  (MODEL_EMAIL)
+# ============================================================
 
 def compose_email(client: anthropic.Anthropic, final_output: str) -> tuple[str, str]:
-    """Returns (subject, html_body)."""
+    """
+    Composes the final HTML email from the last layer's compressed output.
+    Uses MODEL_EMAIL (Opus) — quality matters for client-facing output.
+    Returns (subject, html_body).
+    """
     prompt = EMAIL_COMPOSE_PROMPT.format(final_output=final_output)
     response = client.messages.create(
-        model="claude-opus-4-6",
-        max_tokens=2048,
+        model=MODEL_EMAIL,
+        max_tokens=MAX_TOKENS_EMAIL,
         messages=[{"role": "user", "content": prompt}],
     )
     full_text = next(b.text for b in response.content if b.type == "text")
@@ -261,9 +315,9 @@ def compose_email(client: anthropic.Anthropic, final_output: str) -> tuple[str, 
     return subject, html_body
 
 
-# --------------------------------------------
+# ============================================================
 # Email sender -- Gmail SMTP
-# --------------------------------------------
+# ============================================================
 
 def send_email(subject: str, html_body: str) -> None:
     sender = os.environ["EMAIL_ADDRESS"]
@@ -284,9 +338,9 @@ def send_email(subject: str, html_body: str) -> None:
     print(f"\n[OK] Email sent to {recipient}")
 
 
-# --------------------------------------------
+# ============================================================
 # Daily pipeline
-# --------------------------------------------
+# ============================================================
 
 def run_pipeline():
     sgt = timezone(timedelta(hours=8))
@@ -299,11 +353,17 @@ def run_pipeline():
     for i, layer in enumerate(PIPELINE, 1):
         print(f"-- Layer {i}: {layer['name']} --")
         outputs = orchestrator.run_layer(layer, previous_context)
-        previous_context = format_outputs(outputs)
-        print(f"\n[Layer {i} complete]\n")
+
+        print(f"\n-- Compressing Layer {i} output --")
+        previous_context = compress_layer_output(orchestrator.client, outputs)
+        print(f"\n{'='*60}")
+        print(f"COMPRESSED OUTPUT PASSED TO LAYER {i+1}:")
+        print(f"{'='*60}")
+        print(previous_context)
+        print(f"{'='*60}\n")
+        print(f"[Layer {i} complete]\n")
 
     print("-- Composing email --")
-    # Compose and send email from the final layer's combined output
     subject, html_body = compose_email(orchestrator.client, previous_context)
     print(f"Subject: {subject}")
 
